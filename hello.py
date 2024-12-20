@@ -132,6 +132,16 @@ def fetch_rss_items(rss_urls):
             else:
                 item["published_datetime"] = None
 
+            # Get audio files in enclosures, append as a list
+            if "enclosures" in entry:
+            audio_files = []
+            for enclosure in entry.enclosures:
+                # Check if the enclosure is an audio file
+                if "type" in enclosure and enclosure["type"].startswith("audio/"):
+                    audio_files.append(enclosure["href"])
+            if audio_files:
+                item["audio"] = audio_files
+
             items.append(item)
     return items
 
