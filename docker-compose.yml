@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  opml2json:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    expose:
+      - "8000"
+    networks:
+      - web
+
+networks:
+  web:
+    external: true

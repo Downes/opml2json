@@ -1,0 +1,6 @@
+flask
+feedparser
+listparser
+requests
+flask-cors
+gunicorn
