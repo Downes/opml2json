@@ -1,124 +1,19 @@
-# OPML2JSON
+# opml2json
 
-A Flask-based web service that converts OPML (Outline Processor Markup Language) files to JSON and aggregates RSS feed items with pagination support.
+This is a Python Flask application that retrieves or reads and uploaded OPML file, aggregates and parses the RSS files listed in the OPML, then returns the results as JSON.
 
-## Features
+- results are pages, default 20 listings per page, with a 'cursor' time stamp to start the next page
+- results are sorted chronologically
+- aggregated RSS feeds are cached and retrieved from the origin server no more than once an hour
 
-- **OPML Parsing**: Upload OPML files or provide URLs to OPML documents
-- **RSS Aggregation**: Automatically fetches and aggregates items from all RSS feeds listed in the OPML
-- **Smart Caching**: Implements 1-hour caching for RSS feeds to improve performance
-- **Pagination**: Cursor-based pagination for efficient browsing of large feed collections
-- **CORS Support**: Cross-Origin Resource Sharing enabled for frontend integration
-- **Full Content Extraction**: Retrieves full article content, summaries, and audio enclosures
+The repository includes a simple web form for sending requests to the script. An example of this form may be seen at https://opml2json.downes.ca and you are free to use this service if you wish, instead of downloading and installing this application.
 
-## API Endpoints
+This repository contains:
 
-### POST `/upload_opml`
+- test.opml - this is a simple OPML page used for testing. I have an instance of this page hosted at https://www.downes.ca/test.opml
 
-Accepts OPML file uploads or URLs and returns paginated JSON feed items.
+- hello.py - a server side python script that provides the OPML2JSON service. Install it as a standalone application on a web server. It provides an interface into which you can provide the URL of an OPML file or upload one from your desktop. It will aggregate the RSS feeds listed in the file, sort them, and then present the results as a JSON feed, which you can use in your website or application. Feel free to change the name; I just went with the default. If you don't feel like downloading and installing your own Python script, I host an instance of this script here: https://opml2json.downes.ca 
 
-**Parameters:**
-- `file` (file): OPML file upload
-- `url` (string): URL to an OPML file
-- `cursor` (float, optional): Timestamp cursor for pagination
-- `limit` (int, optional): Number of items per page (default: 20)
+- opml2json.html - an HTML page demonstrating how you can use Javascript to fetch the results from the OPML2JSON service and present them in a readable format. As written, it uses the two pages hosted on downes.ca but you can of course edit it. If you want to use your own OPML file, change the URL from https://www.downes.ca/test.opml to the URL of your own HTML file. If you want to use your own hosted Python script, change the URL from https://opml2json.downes.ca to the URL for your own script.
 
-**Response:**
-```json
-{
-  "items": [
-    {
-      "title": "Article Title",
-      "link": "https://example.com/article",
-      "published": "Mon, 01 Jan 2024 12:00:00 GMT",
-      "summary": "Article summary...",
-      "full_content": "Full article content...",
-      "source": "Feed Title",
-      "author": "Author Name",
-      "audio": ["https://example.com/podcast.mp3"]
-    }
-  ],
-  "next_cursor": 1234567890.0,
-  "title": "OPML Feed Title"
-}
-```
-
-### GET `/`
-
-Simple HTML form for testing the service.
-
-## Installation
-
-### Using Docker (Recommended)
-
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/opml2json.git
-cd opml2json
-```
-
-2. Build and run with Docker Compose:
-```bash
-docker compose build
-docker compose up -d
-```
-
-The service will be available at `http://localhost:8000`
-
-### Manual Installation
-
-1. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-2. Run the application:
-```bash
-# Development
-python hello.py
-
-# Production with Gunicorn
-gunicorn --bind 0.0.0.0:8000 --workers 4 hello:app
-```
-
-## Dependencies
-
-- Flask - Web framework
-- feedparser - RSS/Atom feed parsing
-- listparser - OPML parsing
-- requests - HTTP library
-- flask-cors - CORS support
-- gunicorn - WSGI HTTP server
-
-## Deployment
-
-This application is designed to run as a containerized service behind a reverse proxy (e.g., Caddy, nginx).
-
-Example Caddyfile configuration:
-```caddyfile
-opml2json.example.com {
-  handle /.well-known/acme-challenge/* {
-    root * /srv/www/opml2json.example.com
-    file_server
-  }
-
-  handle {
-    reverse_proxy opml2json:8000
-  }
-}
-```
-
-## Use Cases
-
-- Aggregate multiple RSS feeds into a single stream
-- Convert OPML subscription lists to JSON for web applications
-- Build custom RSS readers with pagination support
-- Extract and cache content from multiple sources
-
-## License
-
-See LICENSE file for details.
-
-## Author
-
-Stephen Downes - stephen@downes.ca
+I will continue to maintain https://opml2json.downes.ca as a public service until and unless it becomes too expensive to do so. I'm open to pull requests that improve the efficiency and usefulness of this service.

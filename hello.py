@@ -5,7 +5,6 @@ import requests  # Import requests for fetching OPML files from URLs
 from datetime import datetime
 from flask_cors import CORS
 import time  # Import time module for caching timestamps
-import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS if needed for frontend interaction
@@ -30,22 +29,17 @@ def upload_opml():
         return jsonify({"error": "No file or URL provided"}), 400
 
     try:
-
         if file:
             # Process uploaded file
             content = file.read().decode('utf-8')
-
+            rss_urls = parse_opml_from_content(content)
         elif url:
             # Fetch the OPML file from the provided URL
             response = requests.get(url)
             if response.status_code != 200:
                 return jsonify({"error": f"Failed to fetch OPML from URL: {response.status_code}"}), 400
             content = response.content.decode('utf-8')
-
-        result = listparser.parse(content)            
-        rss_urls = parse_opml_from_content(result)   # RSS URLs
-        root = ET.fromstring(content)
-        title = root.find('./head/title').text       # OPML Title
+            rss_urls = parse_opml_from_content(content)
 
         if not rss_urls:
             return jsonify({"error": "No RSS URLs found in the OPML file"}), 400
@@ -74,15 +68,16 @@ def upload_opml():
         for item in paginated_items:
             del item["published_datetime"]
 
-        return jsonify({"items": paginated_items, "next_cursor": next_cursor, "title": title})
+        return jsonify({"items": paginated_items, "next_cursor": next_cursor})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 
 
-def parse_opml_from_content(result):
+def parse_opml_from_content(content):
     """Parse OPML content from a string and return a list of RSS URLs."""
+    result = listparser.parse(content)
 
     # Check for parsing errors
     if result.bozo:
@@ -119,11 +114,9 @@ def fetch_rss_items(rss_urls):
             item = {
                 "title": entry.get("title"),
                 "link": entry.get("link"),
-                "guid": entry.get("guid"),
                 "published": entry.get("published"),
                 "summary": entry.get("summary", ""),
                 "source": feed.feed.get("title", url),
-                "author": entry.get("author", "Unattributed"),  # Default to "Unknown"
                 "full_content": 'None'  # Default to None
             }
 
@@ -141,13 +134,13 @@ def fetch_rss_items(rss_urls):
 
             # Get audio files in enclosures, append as a list
             if "enclosures" in entry:
-                audio_files = []
-                for enclosure in entry.enclosures:
-                    # Check if the enclosure is an audio file
-                    if "type" in enclosure and enclosure["type"].startswith("audio/"):
-                        audio_files.append(enclosure["href"])
-                if audio_files:
-                    item["audio"] = audio_files
+            audio_files = []
+            for enclosure in entry.enclosures:
+                # Check if the enclosure is an audio file
+                if "type" in enclosure and enclosure["type"].startswith("audio/"):
+                    audio_files.append(enclosure["href"])
+            if audio_files:
+                item["audio"] = audio_files
 
             items.append(item)
     return items
