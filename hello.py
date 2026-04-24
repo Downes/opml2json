@@ -35,7 +35,7 @@ def upload_opml():
             rss_urls = parse_opml_from_content(content)
         elif url:
             # Fetch the OPML file from the provided URL
-            response = requests.get(url)
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; opml2json/1.0)'})
             if response.status_code != 200:
                 return jsonify({"error": f"Failed to fetch OPML from URL: {response.status_code}"}), 400
             content = response.content.decode('utf-8')
@@ -134,13 +134,13 @@ def fetch_rss_items(rss_urls):
 
             # Get audio files in enclosures, append as a list
             if "enclosures" in entry:
-            audio_files = []
-            for enclosure in entry.enclosures:
-                # Check if the enclosure is an audio file
-                if "type" in enclosure and enclosure["type"].startswith("audio/"):
-                    audio_files.append(enclosure["href"])
-            if audio_files:
-                item["audio"] = audio_files
+                audio_files = []
+                for enclosure in entry.enclosures:
+                    # Check if the enclosure is an audio file
+                    if "type" in enclosure and enclosure["type"].startswith("audio/"):
+                        audio_files.append(enclosure["href"])
+                if audio_files:
+                    item["audio"] = audio_files
 
             items.append(item)
     return items
