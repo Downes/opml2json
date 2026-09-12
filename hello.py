@@ -1,174 +1,360 @@
-from flask import Flask, request, jsonify
-import feedparser
-import listparser 
-import requests  # Import requests for fetching OPML files from URLs
+import asyncio
+import hashlib
+import json
+import os
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime
-from flask_cors import CORS
-import time  # Import time module for caching timestamps
+from typing import Optional
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS if needed for frontend interaction
+import aiohttp
+import feedparser
+import listparser
+import redis.asyncio as aioredis
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
 
-# Global cache for RSS feeds
-feed_cache = {}
+CACHE_TTL = 3600
+USER_AGENT = "Mozilla/5.0 (compatible; opml2json/2.0)"
+
+# kvstore instances /fetch_feed is allowed to verify a caller's token against.
+# kvstore_url is client-supplied (X-Kvstore-Url header) and drives a server-side
+# request that carries the caller's own Bearer token — without this allowlist
+# it's an SSRF + token-forwarding primitive to an arbitrary HTTPS host.
+ALLOWED_KVSTORE_URLS = [
+    u.strip() for u in os.environ.get(
+        "ALLOWED_KVSTORE_URLS", "https://kvstore.mooc.ca,https://kvstore.downes.ca"
+    ).split(",")
+]
+
+redis_client: aioredis.Redis = None
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global redis_client
+    for attempt in range(5):
+        try:
+            redis_client = aioredis.from_url("redis://redis:6379", decode_responses=True)
+            await redis_client.ping()
+            break
+        except Exception as e:
+            if attempt == 4:
+                raise RuntimeError(f"Redis unavailable after 5 attempts: {e}")
+            await asyncio.sleep(2 ** attempt)
+    yield
+    await redis_client.aclose()
 
-@app.route('/upload_opml', methods=['POST'])
-def upload_opml():
-    """Handle OPML file upload or URL, fetch RSS feeds, and return paginated JSON."""
-    file = request.files.get('file')
-    url = request.form.get('url')
-    cursor = request.form.get('cursor', default=None, type=str)  # Get as string, then convert
-    limit = int(request.form.get('limit', default=20))  # Default limit to 20 items
 
-    if cursor:
-        cursor = float(cursor)  # Convert cursor to a float timestamp
+app = FastAPI(lifespan=lifespan)
 
-    if not file and not url:
-        return jsonify({"error": "No file or URL provided"}), 400
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def _verify_token(token: str, kvstore_url: str) -> bool:
+    if not token or not kvstore_url:
+        return False
+    if kvstore_url not in ALLOWED_KVSTORE_URLS:
+        return False
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                kvstore_url.rstrip("/") + "/auth/verify",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if not resp.ok:
+                    return False
+                data = await resp.json()
+                return bool((data or {}).get("username"))
+    except Exception:
+        return False
+
+
+def _parse_feed(content: bytes) -> feedparser.FeedParserDict:
+    return feedparser.parse(content)
+
+
+def _extract_did(feed: feedparser.FeedParserDict) -> Optional[str]:
+    """Extract a did:web DID from feed entries or channel metadata.
+
+    Item-level DIDs take priority (more specific — correct for multi-author feeds).
+    Channel-level is the fallback for feeds where only the channel carries a DID.
+    """
+    # Item-level: first entry with a DID author link or Atom author URI
+    for entry in feed.entries:
+        for link in getattr(entry, "links", []):
+            href = link.get("href", "")
+            if link.get("rel") == "author" and href.startswith("did:"):
+                return href
+        detail = getattr(entry, "author_detail", {}) or {}
+        href = detail.get("href", "")
+        if href.startswith("did:"):
+            return href
+    # Channel-level fallback: atom:link rel="author"
+    for link in getattr(feed.feed, "links", []):
+        href = link.get("href", "")
+        if link.get("rel") == "author" and href.startswith("did:"):
+            return href
+    # Channel-level fallback: Atom <author><uri>
+    detail = getattr(feed.feed, "author_detail", {}) or {}
+    href = detail.get("href", "")
+    if href.startswith("did:"):
+        return href
+    return None
+
+
+def _parse_opml(content: str):
+    return listparser.parse(content)
+
+
+def _entry_to_item(entry, feed_title: str, feed_url: str) -> dict:
+    item = {
+        "guid":         entry.get("id") or entry.get("link") or "",
+        "title":        entry.get("title"),
+        "link":         entry.get("link"),
+        "author":       entry.get("author", ""),
+        "published":    entry.get("published"),
+        "summary":      entry.get("summary", ""),
+        "source":       feed_title or feed_url,
+        "full_content": None,
+    }
+    if entry.get("content"):
+        item["full_content"] = entry.content[0].value
+    elif entry.get("description"):
+        item["full_content"] = entry.get("description")
+    try:
+        dt = datetime(*entry.published_parsed[:6]) if entry.get("published_parsed") else None
+        item["published_ts"] = int(dt.timestamp()) if dt else int(time.time())
+    except (ValueError, OverflowError):
+        item["published_ts"] = int(time.time())
+    if entry.get("enclosures"):
+        audio = [e["href"] for e in entry.enclosures
+                 if (e.get("type") or "").startswith("audio/")]
+        if audio:
+            item["audio"] = audio
+    return item
+
+
+async def _record_error(errors_key: str, error_msg: str) -> None:
+    errors_raw = await redis_client.get(errors_key)
+    state = json.loads(errors_raw) if errors_raw else {"consecutive_errors": 0}
+    n = state["consecutive_errors"] + 1
+    backoff = min(60 * (1 << (n - 1)), 86400)  # 60s, 120s, 240s … capped at 24h
+    await redis_client.setex(errors_key, 86400 * 2, json.dumps({
+        "consecutive_errors": n,
+        "last_error":         error_msg,
+        "last_error_time":    int(time.time()),
+        "backoff_until":      int(time.time()) + backoff,
+    }))
+
+
+async def _clear_errors(errors_key: str) -> None:
+    await redis_client.delete(errors_key)
+
+
+async def _fetch_and_cache(url: str) -> dict:
+    """Fetch a feed, parse it, cache in Redis for 1 hour.
+
+    Uses ETag/Last-Modified for conditional requests — a 304 extends the TTL
+    without re-fetching content. Tracks per-feed errors with exponential backoff
+    so failing feeds are not retried aggressively. Falls back to stale cached data
+    when available. Returns {"title": str, "items": [...], "stale"?: bool, "error"?: str}.
+    """
+    cache_key  = "feed:"        + hashlib.sha256(url.encode()).hexdigest()
+    errors_key = "feed_errors:" + hashlib.sha256(url.encode()).hexdigest()
+
+    cached_raw = await redis_client.get(cache_key)
+    cached = json.loads(cached_raw) if cached_raw else None
+
+    # Honour backoff window — don't hammer failing feeds
+    errors_raw = await redis_client.get(errors_key)
+    if errors_raw:
+        err_state = json.loads(errors_raw)
+        if time.time() < err_state.get("backoff_until", 0):
+            if cached:
+                return {"title": cached["title"], "items": cached["items"],
+                        "stale": True, "error": err_state.get("last_error", "")}
+            raise Exception(f"Feed unavailable (in backoff): {err_state.get('last_error', '')}")
+
+    headers = {"User-Agent": USER_AGENT}
+    if cached:
+        if cached.get("etag"):
+            headers["If-None-Match"] = cached["etag"]
+        elif cached.get("last_modified"):
+            headers["If-Modified-Since"] = cached["last_modified"]
 
     try:
-        if file:
-            # Process uploaded file
-            content = file.read().decode('utf-8')
-            rss_urls = parse_opml_from_content(content)
-        elif url:
-            # Fetch the OPML file from the provided URL
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; opml2json/1.0)'})
-            if response.status_code != 200:
-                return jsonify({"error": f"Failed to fetch OPML from URL: {response.status_code}"}), 400
-            content = response.content.decode('utf-8')
-            rss_urls = parse_opml_from_content(content)
-
-        if not rss_urls:
-            return jsonify({"error": "No RSS URLs found in the OPML file"}), 400
-
-        items = fetch_rss_items(rss_urls)
-        # Sort items by publication date, newest first
-        items = sorted(
-            [item for item in items if item["published_datetime"] is not None],
-            key=lambda x: x["published_datetime"],
-            reverse=True
-        )
-
-        # Apply cursor-based pagination
-        if cursor:
-            items = [item for item in items if item["published_datetime"].timestamp() < cursor]
-
-        # Limit the number of items returned
-        paginated_items = items[:limit]
-
-        # Prepare next cursor (if more items are available)
-        next_cursor = None
-        if len(items) > limit:
-            next_cursor = items[limit]["published_datetime"].timestamp()
-
-        # Remove datetime object before returning JSON
-        for item in paginated_items:
-            del item["published_datetime"]
-
-        return jsonify({"items": paginated_items, "next_cursor": next_cursor})
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 304 and cached:
+                    await redis_client.expire(cache_key, CACHE_TTL)
+                    await _clear_errors(errors_key)
+                    return {"title": cached["title"], "items": cached["items"],
+                            "author_did": cached.get("author_did")}
+                resp.raise_for_status()
+                content = await resp.read()
+                etag = resp.headers.get("ETag")
+                last_modified = resp.headers.get("Last-Modified")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        await _record_error(errors_key, str(e))
+        if cached:
+            return {"title": cached["title"], "items": cached["items"],
+                    "author_did": cached.get("author_did"),
+                    "stale": True, "error": str(e)}
+        raise
+
+    feed = await asyncio.get_running_loop().run_in_executor(None, _parse_feed, content)
+    feed_title = (feed.feed.get("title") or "").strip()
+    items = [_entry_to_item(entry, feed_title, url) for entry in feed.entries]
+    author_did = _extract_did(feed)
+
+    await redis_client.setex(cache_key, CACHE_TTL, json.dumps({
+        "title": feed_title,
+        "items": items,
+        "author_did": author_did,
+        "etag": etag,
+        "last_modified": last_modified,
+    }))
+    await _clear_errors(errors_key)
+    return {"title": feed_title, "items": items, "author_did": author_did}
 
 
-
-
-def parse_opml_from_content(content):
-    """Parse OPML content from a string and return a list of RSS URLs."""
-    result = listparser.parse(content)
-
-    # Check for parsing errors
-    if result.bozo:
-        raise ValueError(f"Error parsing OPML: {result.bozo_exception}")
-
-    # Extract RSS URLs from the feeds list
-    rss_urls = [feed.url for feed in result.feeds if feed.url]
-    return rss_urls
-
-def fetch_rss_items(rss_urls):
-    """Fetch and aggregate items from a list of RSS URLs, with caching."""
-    items = []
-    for url in rss_urls:
-        current_time = time.time()
-        cache_entry = feed_cache.get(url)
-
-        if cache_entry:
-            timestamp, cached_feed = cache_entry
-            # Check if the cached feed is less than 1 hour old (3600 seconds)
-            if current_time - timestamp < 3600:
-                # Use cached feed
-                feed = cached_feed
-            else:
-                # Fetch new feed and update cache
-                feed = feedparser.parse(url)
-                feed_cache[url] = (current_time, feed)
-        else:
-            # Fetch feed and add to cache
-            feed = feedparser.parse(url)
-            feed_cache[url] = (current_time, feed)
-
-        # Process feed entries
-        for entry in feed.entries:
-            item = {
-                "title": entry.get("title"),
-                "link": entry.get("link"),
-                "published": entry.get("published"),
-                "summary": entry.get("summary", ""),
-                "source": feed.feed.get("title", url),
-                "full_content": 'None'  # Default to None
-            }
-
-            # Check for full content in 'content' or 'description'
-            if "content" in entry and entry.content:
-                item["full_content"] = entry.content[0].value  # Content is usually a list
-            elif "description" in entry:
-                item["full_content"] = entry.get("description")
-
-            # Convert published date to datetime for sorting
-            if "published_parsed" in entry and entry.published_parsed:
-                item["published_datetime"] = datetime(*entry.published_parsed[:6])
-            else:
-                item["published_datetime"] = None
-
-            # Get audio files in enclosures, append as a list
-            if "enclosures" in entry:
-                audio_files = []
-                for enclosure in entry.enclosures:
-                    # Check if the enclosure is an audio file
-                    if "type" in enclosure and enclosure["type"].startswith("audio/"):
-                        audio_files.append(enclosure["href"])
-                if audio_files:
-                    item["audio"] = audio_files
-
-            items.append(item)
-    return items
-
-@app.route('/')
-def home():
-    """Display a simple home page with an upload form."""
+@app.get("/", response_class=HTMLResponse)
+async def home():
     return """
     <h1>Welcome to the OPML2JSON Service</h1>
-    <p>Please upload an OPML file, provide a URL, or specify a cursor for pagination.</p>
     <form action="/upload_opml" method="post" enctype="multipart/form-data">
-        <label for="file">Choose an OPML file:</label>
-        <input type="file" id="file" name="file" accept=".opml">
-        <br><br>
-        <label for="url">Or provide a URL to an OPML file:</label>
-        <input type="url" id="url" name="url" placeholder="https://example.com/feeds.opml">
-        <br><br>
-        <label for="cursor">Cursor (Timestamp for Pagination):</label>
-        <input type="text" id="cursor" name="cursor" placeholder="1698790400.0">
-        <br><br>
-        <label for="limit">Limit (Number of Results):</label>
-        <input type="number" id="limit" name="limit" value="20" min="1">
-        <br><br>
+        <label>OPML file: <input type="file" name="file" accept=".opml"></label><br><br>
+        <label>Or URL: <input type="url" name="url" placeholder="https://example.com/feeds.opml"></label><br><br>
+        <label>Cursor: <input type="text" name="cursor" placeholder="1698790400.0"></label><br><br>
+        <label>Limit: <input type="number" name="limit" value="20" min="1"></label><br><br>
         <button type="submit">Submit</button>
     </form>
     """
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+@app.post("/upload_opml")
+async def upload_opml(
+    file:   Optional[UploadFile] = File(None),
+    url:    Optional[str]        = Form(None),
+    cursor: Optional[str]        = Form(None),
+    limit:  int                  = Form(20),
+):
+    cursor_ts = float(cursor) if cursor else None
+    if not file and not url:
+        return JSONResponse({"error": "No file or URL provided"}, status_code=400)
+    try:
+        if file:
+            content = (await file.read()).decode("utf-8")
+        else:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers={"User-Agent": USER_AGENT},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if not resp.ok:
+                        return JSONResponse(
+                            {"error": f"Failed to fetch OPML: {resp.status}"}, status_code=400)
+                    content = await resp.text()
+
+        result = await asyncio.get_running_loop().run_in_executor(None, _parse_opml, content)
+        if result.bozo:
+            raise ValueError(f"Error parsing OPML: {result.bozo_exception}")
+
+        rss_urls = [f.url for f in result.feeds if f.url]
+        if not rss_urls:
+            return JSONResponse({"error": "No RSS URLs found in the OPML file"}, status_code=400)
+
+        fetched = await asyncio.gather(
+            *[_fetch_and_cache(u) for u in rss_urls],
+            return_exceptions=True,
+        )
+
+        all_items = []
+        for feed_result in fetched:
+            if isinstance(feed_result, Exception):
+                continue
+            all_items.extend(feed_result["items"])
+
+        all_items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+        if cursor_ts:
+            all_items = [i for i in all_items if i.get("published_ts", 0) < cursor_ts]
+        paginated = all_items[:limit]
+        next_cursor = all_items[limit]["published_ts"] if len(all_items) > limit else None
+        return {"items": paginated, "next_cursor": next_cursor}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/list_feeds")
+async def list_feeds(
+    url:  Optional[str]        = Form(None),
+    file: Optional[UploadFile] = File(None),
+):
+    if not file and not url:
+        return JSONResponse({"ok": False, "error": "No file or URL provided"}, status_code=400)
+    try:
+        if file:
+            content = (await file.read()).decode("utf-8")
+        else:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, headers={"User-Agent": USER_AGENT},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if not resp.ok:
+                        return JSONResponse(
+                            {"ok": False, "error": f"HTTP {resp.status}"}, status_code=400)
+                    content = await resp.text()
+        result = await asyncio.get_running_loop().run_in_executor(None, _parse_opml, content)
+        if result.bozo:
+            raise ValueError(str(result.bozo_exception))
+        feeds = [{"url": f.url, "title": f.title or f.url} for f in result.feeds if f.url]
+        opml_title = getattr(result.meta, "title", "") or ""
+        return {"ok": True, "title": opml_title, "feeds": feeds}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/fetch_feed")
+async def fetch_feed(request: Request, url: Optional[str] = None):
+    token       = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    kvstore_url = request.headers.get("X-Kvstore-Url", "").strip()
+
+    if not kvstore_url or not await _verify_token(token, kvstore_url):
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    if not url:
+        return JSONResponse({"ok": False, "error": "url required"}, status_code=400)
+
+    try:
+        result = await _fetch_and_cache(url)
+        response = {"ok": True, "title": result["title"], "feed_url": url, "items": result["items"]}
+        if result.get("author_did"):
+            response["author_did"] = result["author_did"]
+        if result.get("stale"):
+            response["stale"] = True
+            response["error"] = result.get("error", "")
+        return response
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/feed_meta")
+async def feed_meta(url: Optional[str] = None):
+    """Return feed title and author_did without items. Public — no auth required."""
+    if not url:
+        return JSONResponse({"ok": False, "error": "url required"}, status_code=400)
+    try:
+        result = await _fetch_and_cache(url)
+        return {"ok": True, "title": result["title"], "author_did": result.get("author_did")}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)

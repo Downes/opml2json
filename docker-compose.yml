@@ -6,11 +6,38 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     expose:
       - "8000"
+    depends_on:
+      - redis
     networks:
       - web
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - internal
 
 networks:
   web:
     external: true
+  internal:
+    driver: bridge
+
+volumes:
+  redis_data:

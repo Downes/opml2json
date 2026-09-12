@@ -1,6 +1,7 @@
-flask
+fastapi
+uvicorn[standard]
+aiohttp
 feedparser
 listparser
-requests
-flask-cors
-gunicorn
+python-multipart
+redis
