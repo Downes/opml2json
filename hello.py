@@ -15,6 +15,13 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from admin_settings import (
+    SettingField,
+    get_setting,
+    is_admin,
+    register_admin_settings_routes,
+)
+
 CACHE_TTL = 3600
 USER_AGENT = "Mozilla/5.0 (compatible; opml2json/2.0)"
 
@@ -22,13 +29,22 @@ USER_AGENT = "Mozilla/5.0 (compatible; opml2json/2.0)"
 # kvstore_url is client-supplied (X-Kvstore-Url header) and drives a server-side
 # request that carries the caller's own Bearer token — without this allowlist
 # it's an SSRF + token-forwarding primitive to an arbitrary HTTPS host.
-ALLOWED_KVSTORE_URLS = [
-    u.strip() for u in os.environ.get(
-        "ALLOWED_KVSTORE_URLS", "https://kvstore.mooc.ca,https://kvstore.downes.ca"
-    ).split(",")
-]
+# Fallback default; overridden by admin_settings.ALLOWED_KVSTORE_URLS once an
+# admin saves one via /admin/settings (see _allowed_kvstore_urls()).
+ALLOWED_KVSTORE_URLS_DEFAULT = os.environ.get(
+    "ALLOWED_KVSTORE_URLS", "https://kvstore.mooc.ca,https://kvstore.downes.ca"
+)
 
 redis_client: aioredis.Redis = None
+
+
+def get_redis() -> aioredis.Redis:
+    return redis_client
+
+
+async def _allowed_kvstore_urls() -> list[str]:
+    raw = await get_setting(get_redis, "ALLOWED_KVSTORE_URLS", default=ALLOWED_KVSTORE_URLS_DEFAULT)
+    return [u.strip() for u in raw.split(",") if u.strip()]
 
 
 @asynccontextmanager
@@ -57,11 +73,14 @@ app.add_middleware(
 )
 
 
-async def _verify_token(token: str, kvstore_url: str) -> bool:
+async def _verify_token(token: str, kvstore_url: str) -> Optional[str]:
+    """Verify a Bearer token against kvstore_url. Returns the username on
+    success, or None — callers that only need a yes/no check can still use
+    this directly in a boolean context (`if not await _verify_token(...)`)."""
     if not token or not kvstore_url:
-        return False
-    if kvstore_url not in ALLOWED_KVSTORE_URLS:
-        return False
+        return None
+    if kvstore_url not in await _allowed_kvstore_urls():
+        return None
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -70,11 +89,50 @@ async def _verify_token(token: str, kvstore_url: str) -> bool:
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
                 if not resp.ok:
-                    return False
+                    return None
                 data = await resp.json()
-                return bool((data or {}).get("username"))
+                return (data or {}).get("username") or None
     except Exception:
-        return False
+        return None
+
+
+async def _require_admin(request: Request):
+    """Mirrors fetch_feed's manual header parsing. Returns (username, None)
+    on success, or (None, (body, status)) on failure."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    kvstore_url = request.headers.get("X-Kvstore-Url", "").strip()
+    username = await _verify_token(token, kvstore_url)
+    if not username:
+        return None, ({"error": "Unauthorized"}, 401)
+    if not is_admin(username):
+        return None, ({"error": "Forbidden"}, 403)
+    return username, None
+
+
+SETTINGS_SCHEMA = [
+    SettingField(
+        "ENABLED", "Enabled", "boolean", False, None,
+        "When off, this app's functional endpoints return 503. /admin/settings "
+        "stays reachable so you can turn it back on.",
+    ),
+    SettingField(
+        "ALLOWED_KVSTORE_URLS", "Allowed KVStore URLs", "text", False, None,
+        "Comma-separated kvstore instances allowed to issue tokens for this app "
+        "(checked against the client's X-Kvstore-Url header on every request).",
+    ),
+]
+SETTINGS_DEFAULTS = {"ENABLED": "true", "ALLOWED_KVSTORE_URLS": ALLOWED_KVSTORE_URLS_DEFAULT}
+
+register_admin_settings_routes(app, SETTINGS_SCHEMA, get_redis, _require_admin, SETTINGS_DEFAULTS)
+
+
+@app.middleware("http")
+async def _enabled_gate(request: Request, call_next):
+    if request.url.path == "/admin/settings":
+        return await call_next(request)
+    if await get_setting(get_redis, "ENABLED", default="true") == "false":
+        return JSONResponse({"error": "Service temporarily disabled by administrator"}, status_code=503)
+    return await call_next(request)
 
 
 def _parse_feed(content: bytes) -> feedparser.FeedParserDict:
