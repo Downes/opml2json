@@ -1,3 +1,14 @@
+"""
+opml2json — OPML-to-JSON conversion and RSS feed aggregation, with an
+optional kvstore identity layer for /fetch_feed and /admin/settings.
+
+Those endpoints require a valid kvstore Bearer token, verified locally via
+JWT/JWKS ("Pattern B") against the issuer named in the token's own `iss`
+claim — open to any kvstore instance, no allowlist. Pre-migration opaque
+tokens fall back to the client-named kvstore (X-Kvstore-Url header), gated
+by ALLOWED_KVSTORE_URLS.
+"""
+
 import asyncio
 import hashlib
 import json
@@ -15,25 +26,28 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from admin_settings import (
+from clist_server_admin.redis import (
     SettingField,
     get_setting,
-    is_admin,
     register_admin_settings_routes,
 )
+from clist_kvstore_auth.asyncio import Identity, verify_token as _kv_verify_token
 
 CACHE_TTL = 3600
 USER_AGENT = "Mozilla/5.0 (compatible; opml2json/2.0)"
 
-# kvstore instances /fetch_feed is allowed to verify a caller's token against.
-# kvstore_url is client-supplied (X-Kvstore-Url header) and drives a server-side
-# request that carries the caller's own Bearer token — without this allowlist
-# it's an SSRF + token-forwarding primitive to an arbitrary HTTPS host.
+# Trusted admin issuers, AND the fallback target allowlist for opaque
+# (pre-migration) tokens' callback verification — see _verify_identity()
+# and _is_admin(). Real JWTs are verified locally via JWKS against whatever
+# issuer their own `iss` claim names ("Pattern B") — open to any kvstore
+# instance, no allowlist; this list no longer gates ordinary verification,
+# only opaque-token fallback (anti-SSRF, unchanged) and admin rights.
 # Fallback default; overridden by admin_settings.ALLOWED_KVSTORE_URLS once an
 # admin saves one via /admin/settings (see _allowed_kvstore_urls()).
 ALLOWED_KVSTORE_URLS_DEFAULT = os.environ.get(
     "ALLOWED_KVSTORE_URLS", "https://kvstore.mooc.ca,https://kvstore.downes.ca"
 )
+ADMIN_USERNAMES = {u.strip() for u in os.environ.get("ADMIN_USERNAMES", "").split(",") if u.strip()}
 
 redis_client: aioredis.Redis = None
 
@@ -73,27 +87,46 @@ app.add_middleware(
 )
 
 
+def _is_jwt(token: str) -> bool:
+    return bool(token) and token.count(".") == 2
+
+
+async def _verify_identity(token: str, kvstore_url: str) -> Optional[Identity]:
+    """Verify a Bearer token, returning the caller's Identity or None.
+
+    Real JWTs are verified locally via JWKS against the issuer named in the
+    token's own `iss` claim ("Pattern B") — open to any kvstore instance, no
+    allowlist; `kvstore_url` (the client's X-Kvstore-Url header) is ignored
+    for these, since `iss` is tamper-proof and already says where to fetch
+    JWKS from. Opaque (pre-migration) tokens carry no `iss` and can't be
+    verified locally, so they still fall back to the callback —
+    `kvstore_url` must be in ALLOWED_KVSTORE_URLS for that path only, since
+    it drives a server-side request carrying the caller's own token to a
+    client-supplied host (the original SSRF + token-forwarding concern this
+    allowlist exists for, unchanged for legacy tokens).
+    """
+    if not token:
+        return None
+    if not _is_jwt(token) and kvstore_url not in await _allowed_kvstore_urls():
+        return None
+    identity, err = await _kv_verify_token(f"Bearer {token}", kvstore_url)
+    return None if err else identity
+
+
 async def _verify_token(token: str, kvstore_url: str) -> Optional[str]:
-    """Verify a Bearer token against kvstore_url. Returns the username on
-    success, or None — callers that only need a yes/no check can still use
-    this directly in a boolean context (`if not await _verify_token(...)`)."""
-    if not token or not kvstore_url:
-        return None
-    if kvstore_url not in await _allowed_kvstore_urls():
-        return None
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                kvstore_url.rstrip("/") + "/auth/verify",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if not resp.ok:
-                    return None
-                data = await resp.json()
-                return (data or {}).get("username") or None
-    except Exception:
-        return None
+    """Back-compat wrapper for callers (fetch_feed) that only need the
+    verified username, not the full Identity."""
+    identity = await _verify_identity(token, kvstore_url)
+    return identity.username if identity else None
+
+
+async def _is_admin(identity: Identity) -> bool:
+    # Reimplemented locally (not clist_server_admin.redis.is_admin, nor
+    # clist_kvstore_auth.asyncio.is_admin) because ALLOWED_KVSTORE_URLS —
+    # this app's trusted-admin-issuer set — is DB-overridable via
+    # /admin/settings, not just a static env var, and neither shared
+    # package's own is_admin() checks the issuer against a DB override.
+    return identity.username in ADMIN_USERNAMES and identity.iss in await _allowed_kvstore_urls()
 
 
 async def _require_admin(request: Request):
@@ -101,12 +134,12 @@ async def _require_admin(request: Request):
     on success, or (None, (body, status)) on failure."""
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     kvstore_url = request.headers.get("X-Kvstore-Url", "").strip()
-    username = await _verify_token(token, kvstore_url)
-    if not username:
+    identity = await _verify_identity(token, kvstore_url)
+    if not identity:
         return None, ({"error": "Unauthorized"}, 401)
-    if not is_admin(username):
+    if not await _is_admin(identity):
         return None, ({"error": "Forbidden"}, 403)
-    return username, None
+    return identity.username, None
 
 
 SETTINGS_SCHEMA = [
@@ -117,8 +150,11 @@ SETTINGS_SCHEMA = [
     ),
     SettingField(
         "ALLOWED_KVSTORE_URLS", "Allowed KVStore URLs", "text", False, None,
-        "Comma-separated kvstore instances allowed to issue tokens for this app "
-        "(checked against the client's X-Kvstore-Url header on every request).",
+        "Comma-separated kvstore instances trusted for ADMIN_USERNAMES admin "
+        "access, and allowed as the fallback verification target for "
+        "pre-migration opaque tokens (via the client's X-Kvstore-Url "
+        "header). Does NOT gate ordinary token verification, which is local "
+        "JWT/JWKS and open to any issuer.",
     ),
 ]
 SETTINGS_DEFAULTS = {"ENABLED": "true", "ALLOWED_KVSTORE_URLS": ALLOWED_KVSTORE_URLS_DEFAULT}
@@ -388,7 +424,7 @@ async def fetch_feed(request: Request, url: Optional[str] = None):
     token       = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     kvstore_url = request.headers.get("X-Kvstore-Url", "").strip()
 
-    if not kvstore_url or not await _verify_token(token, kvstore_url):
+    if not await _verify_token(token, kvstore_url):
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     if not url:
         return JSONResponse({"ok": False, "error": "url required"}, status_code=400)
